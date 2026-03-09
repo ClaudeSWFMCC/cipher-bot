@@ -28,10 +28,10 @@ log = logging.getLogger("CipherBot")
 API_KEY    = os.environ.get("KRAKEN_API_KEY", "")
 API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 PAIR       = os.environ.get("TRADING_PAIR", "XBTUSD")
-TIMEFRAME  = int(os.environ.get("TIMEFRAME_MINUTES", "240"))  # 4h default
+TIMEFRAME  = int(os.environ.get("TIMEFRAME_MINUTES", "60"))   # 1h for wider range markets
 CAPITAL    = float(os.environ.get("CAPITAL", "10000"))
 RISK_PCT   = float(os.environ.get("RISK_PCT", "2"))
-TP_MULTI   = float(os.environ.get("TP_MULTI", "2"))
+TP_MULTI   = float(os.environ.get("TP_MULTI", "2.5"))          # 2.5x to catch bigger swings
 PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
 FEE_RATE   = 0.001  # 0.10% Kraken Pro
 
@@ -140,22 +140,22 @@ def check_signals(candle_list):
     vwap       = compute_vwap(candle_list[-10:])
     price      = closes[-1]
     vwap_above = price > vwap
-    trending   = abs(mom10) > (price * 0.001)  # 0.1% of price move over 10 candles
+    trending   = abs(mom10) > (price * 0.0008)  # loosened to 0.08% — catches more moves in wide range
 
-    # Green Dot — bullish reversal
+    # Green Dot — bullish reversal — loosened momentum threshold
     prev_mom5 = compute_momentum(closes[:-1], 5) if len(closes) > 6 else 0
     green_dot = (
-        mom5 > (price * 0.002) and   # strong positive momentum
+        mom5 > (price * 0.0015) and  # loosened from 0.002 to 0.0015
         prev_mom5 < 0 and             # was negative before
-        25 < rsi < 55 and             # RSI in buy zone
-        trending                       # clear trend exists
+        25 < rsi < 58 and             # slightly wider RSI range
+        trending
     )
 
-    # Blue Triangle — bearish reversal
+    # Blue Triangle — bearish reversal — loosened momentum threshold
     blue_tri = (
-        mom5 < -(price * 0.002) and
+        mom5 < -(price * 0.0015) and  # loosened from 0.002 to 0.0015
         prev_mom5 > 0 and
-        45 < rsi < 75 and
+        42 < rsi < 78 and             # slightly wider RSI range
         trending
     )
 
@@ -233,7 +233,7 @@ def check_trade_exit(current_high, current_low):
         stats["pnl"]    += loss
         stats["fees"]   += total_fees
         stats["trades"] += 1
-        cooldown = 5
+        cooldown = 3  # reduced from 5 to 3 candles after loss
 
         log.info(f"🔴 STOP LOSS HIT")
         log.info(f"   Loss:       ${abs(open_trade['risk']):.2f}")
@@ -253,7 +253,7 @@ def check_trade_exit(current_high, current_low):
         stats["pnl"]    += profit
         stats["fees"]   += total_fees
         stats["trades"] += 1
-        cooldown = 3
+        cooldown = 2  # reduced from 3 to 2 candles after win
 
         log.info(f"✅ TAKE PROFIT HIT")
         log.info(f"   Gross:      ${gross:.2f}")
