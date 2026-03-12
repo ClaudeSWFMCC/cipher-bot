@@ -28,7 +28,7 @@ log = logging.getLogger("CipherBot")
 API_KEY    = os.environ.get("KRAKEN_API_KEY", "")
 API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 PAIR       = os.environ.get("TRADING_PAIR", "XBTUSD")
-TIMEFRAME  = int(os.environ.get("TIMEFRAME_MINUTES", "60"))   # 1h for wider range markets
+TIMEFRAME  = int(os.environ.get("TIMEFRAME_MINUTES", "240"))  # 4h — cleaner signals per Market Cipher guidance
 CAPITAL    = float(os.environ.get("CAPITAL", "10000"))
 RISK_PCT   = float(os.environ.get("RISK_PCT", "2"))
 TP_MULTI   = float(os.environ.get("TP_MULTI", "2.5"))          # 2.5x to catch bigger swings
@@ -126,6 +126,8 @@ def compute_vwap(candle_list):
 def check_signals(candle_list):
     """
     Market Cipher inspired signal logic.
+    Green Dot fires ONLY from deeply oversold conditions (RSI < 38)
+    This prevents buying at tops — signal must come from a beaten down price
     Returns: "BUY", "SELL", or None
     """
     if len(candle_list) < 15:
@@ -140,39 +142,48 @@ def check_signals(candle_list):
     vwap       = compute_vwap(candle_list[-10:])
     price      = closes[-1]
     vwap_above = price > vwap
-    trending   = abs(mom10) > (price * 0.0008)  # loosened to 0.08% — catches more moves in wide range
 
-    # Green Dot — bullish reversal — loosened momentum threshold
-    prev_mom5 = compute_momentum(closes[:-1], 5) if len(closes) > 6 else 0
+    # Trend filter — price must be moving clearly
+    trending   = abs(mom10) > (price * 0.001)
+
+    # Previous momentum to detect flip
+    prev_mom5  = compute_momentum(closes[:-1], 5) if len(closes) > 6 else 0
+
+    # ── GREEN DOT — correct Market Cipher logic ──────────────────────────────
+    # Must fire from DEEPLY OVERSOLD territory (RSI < 38)
+    # Momentum was negative (price falling) and has now flipped positive (bouncing)
+    # This catches bottoms not tops
     green_dot = (
-        mom5 > (price * 0.0015) and  # loosened from 0.002 to 0.0015
-        prev_mom5 < 0 and             # was negative before
-        25 < rsi < 58 and             # slightly wider RSI range
-        trending
+        rsi < 38 and                   # deeply oversold — key requirement
+        mom5 > (price * 0.001) and     # momentum turning positive
+        prev_mom5 < 0 and              # was falling before
+        trending                        # clear market direction
     )
 
-    # Blue Triangle — bearish reversal — loosened momentum threshold
+    # ── BLUE TRIANGLE — overbought reversal ──────────────────────────────────
+    # Only used as exit warning — we are not shorting
     blue_tri = (
-        mom5 < -(price * 0.0015) and  # loosened from 0.002 to 0.0015
-        prev_mom5 > 0 and
-        42 < rsi < 78 and             # slightly wider RSI range
+        rsi > 62 and                   # overbought territory
+        mom5 < -(price * 0.001) and    # momentum turning negative
+        prev_mom5 > 0 and              # was rising before
         trending
     )
 
+    # Only take BUY signals — no shorting as per Mark's preference
     signal = None
     if green_dot and vwap_above:
         signal = "BUY"
-    elif blue_tri and not vwap_above:
-        signal = "SELL"
 
     indicators = {
-        "rsi": round(rsi, 1),
-        "momentum": round(mom5, 2),
-        "vwap": round(vwap, 2),
+        "rsi":        round(rsi, 1),
+        "momentum":   round(mom5, 2),
+        "vwap":       round(vwap, 2),
         "vwap_above": vwap_above,
-        "trending": trending,
-        "green_dot": green_dot,
-        "blue_tri": blue_tri,
+        "trending":   trending,
+        "green_dot":  green_dot,
+        "blue_tri":   blue_tri,
+        "oversold":   rsi < 38,
+    }
     }
 
     return signal, indicators
@@ -276,7 +287,7 @@ def print_status(price, indicators):
     log.info(f"📊 {PAIR} | Price: ${price:,.2f} | RSI: {indicators.get('rsi', '?')}")
     log.info(f"   Capital: ${capital:,.2f} | P&L: ${stats['pnl']:+.2f} | Fees: ${stats['fees']:.2f}")
     log.info(f"   Trades: {stats['trades']} | Wins: {stats['wins']} | Losses: {stats['losses']} | Win Rate: {win_rate():.0f}%")
-    log.info(f"   Green Dot: {indicators.get('green_dot')} | VWAP Above: {indicators.get('vwap_above')} | Trending: {indicators.get('trending')}")
+    log.info(f"   Green Dot: {indicators.get('green_dot')} | Oversold: {indicators.get('oversold')} | VWAP Above: {indicators.get('vwap_above')} | Trending: {indicators.get('trending')}")
     if open_trade:
         unrealized = (price - open_trade["entry"]) * open_trade["size"]
         log.info(f"   Open Trade: Entry ${open_trade['entry']:,.2f} | Unrealized P&L: ${unrealized:+.2f}")
