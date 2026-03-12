@@ -184,7 +184,6 @@ def check_signals(candle_list):
         "blue_tri":   blue_tri,
         "oversold":   rsi < 38,
     }
-    }
 
     return signal, indicators
 
