@@ -155,7 +155,7 @@ def check_signals(candle_list):
     # This catches bottoms not tops
     green_dot = (
         rsi < 38 and                   # deeply oversold — key requirement
-        mom5 > (price * 0.001) and     # momentum turning positive
+        mom5 > (price * 0.0007) and     # momentum turning positive
         prev_mom5 < 0 and              # was falling before
         trending                        # clear market direction
     )
@@ -164,7 +164,7 @@ def check_signals(candle_list):
     # Only used as exit warning — we are not shorting
     blue_tri = (
         rsi > 62 and                   # overbought territory
-        mom5 < -(price * 0.001) and    # momentum turning negative
+        mom5 < -(price * 0.0007) and    # momentum turning negative
         prev_mom5 > 0 and              # was rising before
         trending
     )
