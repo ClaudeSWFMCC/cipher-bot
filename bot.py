@@ -1,5 +1,5 @@
 """
-Cipher Bot v5.1 — Market Cipher Strategy Engine
+Cipher Bot v5.2 — Dual Timeframe Strategy
 Kraken Pro Paper Trading Bot
 Runs 24/7 on Railway
 
@@ -7,12 +7,17 @@ v5 Changes:
 - Switched from 200MA back to 50MA (better suited for 4-hour swing trading)
 - RSI threshold loosened from 38 to 45 (catches more real dip opportunities)
 - Momentum threshold cut in half (from 0.1% to 0.05% of price)
-- 200MA was too conservative for swing trading — 50MA spans ~8 days on 4h chart
 
 v5.1 Bug Fixes:
 - FIX 1: Exit checks now use live price, not stale candle high/low
 - FIX 2: Signal candle lock — one trade per unique candle timestamp only
 - FIX 3: Cooldown removed (was decrementing every 30s tick, not per candle)
+
+v5.2 Changes — Dual Timeframe:
+- 4-HOUR candles: trend filter only (50MA, VWAP direction)
+- 1-HOUR candles: RSI, momentum flip, and entry timing
+- Benefit: catches momentum reversals 4x sooner than pure 4h approach
+- Stop loss still based on 1h signal candle low for tighter risk control
 """
 
 import os
@@ -33,24 +38,29 @@ log = logging.getLogger("CipherBot")
 API_KEY    = os.environ.get("KRAKEN_API_KEY", "")
 API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 PAIR       = os.environ.get("TRADING_PAIR", "XBTUSD")
-TIMEFRAME  = int(os.environ.get("TIMEFRAME_MINUTES", "240"))   # 4h candles
 CAPITAL    = float(os.environ.get("CAPITAL", "10000"))
 RISK_PCT   = float(os.environ.get("RISK_PCT", "2"))
 TP_MULTI   = float(os.environ.get("TP_MULTI", "2.5"))
 PAPER      = os.environ.get("PAPER_MODE", "true").lower() == "true"
 
-MA_PERIOD      = 50    # v5: back to 50MA — right size for 4h swing trading
-CANDLES_NEEDED = MA_PERIOD + 15  # enough history for all indicators
+# Timeframes
+TF_TREND  = 240   # 4-hour candles — trend filter (50MA, VWAP)
+TF_ENTRY  = 60    # 1-hour candles — momentum flip and entry signal
+
+MA_PERIOD        = 50   # Applied to 4h candles
+TF_TREND_NEEDED  = MA_PERIOD + 15
+TF_ENTRY_NEEDED  = 20   # 20 x 1h candles is plenty for RSI + momentum
 
 # ── State ─────────────────────────────────────────────────────────────────────
-candles             = deque(maxlen=CANDLES_NEEDED)
+candles_4h          = deque(maxlen=TF_TREND_NEEDED)
+candles_1h          = deque(maxlen=TF_ENTRY_NEEDED)
 open_trade          = None
 tick_count          = 0
 wins                = 0
 losses              = 0
 total_pnl           = 0.0
 total_fees          = 0.0
-last_signal_candle  = None   # FIX 2: timestamp of candle that triggered last entry
+last_signal_candle  = None  # timestamp of 1h candle that last triggered entry
 
 # ── Kraken API ────────────────────────────────────────────────────────────────
 def get_price():
@@ -70,11 +80,12 @@ def get_price():
         log.error(f"Price fetch error: {e}")
         return None
 
-def get_candles():
+def get_candles(interval, count):
+    """Fetch completed candles for a given interval (minutes)."""
     try:
         r = requests.get(
             "https://api.kraken.com/0/public/OHLC",
-            params={"pair": PAIR, "interval": TIMEFRAME},
+            params={"pair": PAIR, "interval": interval},
             timeout=15
         )
         data = r.json()
@@ -93,9 +104,9 @@ def get_candles():
                 "close":  float(c[4]),
                 "volume": float(c[6])
             })
-        return parsed[-CANDLES_NEEDED:]
+        return parsed[-count:]
     except Exception as e:
-        log.error(f"Candle fetch error: {e}")
+        log.error(f"Candle fetch error ({interval}min): {e}")
         return []
 
 # ── Indicators ────────────────────────────────────────────────────────────────
@@ -127,41 +138,61 @@ def compute_ma(closes, period):
     return sum(closes[-period:]) / period
 
 # ── Signal Logic ──────────────────────────────────────────────────────────────
-def check_signals(candle_list):
+def check_trend(candle_list_4h):
     """
-    v5 Signal Logic:
-    - 50MA trend filter (price must be above 50MA — uptrend confirmed)
-    - RSI below 45 (meaningful pullback, not just any dip)
-    - Momentum threshold 0.05% of price (half of v4 — catches smaller bounces)
-    - Momentum must flip from negative to positive (bottom confirmation)
-    - VWAP above required
+    4-HOUR TREND FILTER
+    Confirms we are in an uptrend before allowing any entry.
+    Returns (trend_ok, trend_indicators)
     """
-    if len(candle_list) < CANDLES_NEEDED:
+    if len(candle_list_4h) < TF_TREND_NEEDED:
+        return False, {}
+
+    closes   = [c["close"] for c in candle_list_4h]
+    price    = closes[-1]
+    ma50     = compute_ma(closes, MA_PERIOD)
+    vwap_4h  = compute_vwap(candle_list_4h[-10:])
+
+    above_50ma  = price > ma50
+    vwap_above  = price > vwap_4h
+
+    # Trend is valid only if price is above both 50MA and 4h VWAP
+    trend_ok = above_50ma and vwap_above
+
+    return trend_ok, {
+        "ma50":       round(ma50, 2),
+        "vwap_4h":    round(vwap_4h, 2),
+        "above_50ma": above_50ma,
+        "vwap_above": vwap_above,
+    }
+
+def check_entry(candle_list_1h):
+    """
+    1-HOUR ENTRY SIGNAL
+    Looks for RSI oversold + momentum flip on 1h candles.
+    Returns (signal, entry_indicators)
+    """
+    if len(candle_list_1h) < TF_ENTRY_NEEDED:
         return None, {}
 
-    closes = [c["close"] for c in candle_list]
-    price  = closes[-1]
+    closes        = [c["close"] for c in candle_list_1h]
+    price         = closes[-1]
+    rsi           = compute_rsi(closes)
+    mom5          = compute_momentum(closes, 5)
+    mom10         = compute_momentum(closes, 10)
+    prev_mom5     = compute_momentum(closes[:-1], 5) if len(closes) > 6 else 0
+    mom_threshold = price * 0.0005   # 0.05% of price
 
-    rsi       = compute_rsi(closes)
-    mom5      = compute_momentum(closes, 5)
-    mom10     = compute_momentum(closes, 10)
-    prev_mom5 = compute_momentum(closes[:-1], 5) if len(closes) > 6 else 0
-    vwap      = compute_vwap(candle_list[-10:])
-    ma50      = compute_ma(closes, MA_PERIOD)
+    trending  = abs(mom10) > (price * 0.001)
 
-    vwap_above    = price > vwap
-    above_50ma    = price > ma50
-    trending      = abs(mom10) > (price * 0.001)
-    mom_threshold = price * 0.0005
-
+    # GREEN DOT on 1h: RSI oversold + momentum flipping positive
     green_dot = (
         rsi < 45 and
         mom5 > mom_threshold and
         prev_mom5 < 0 and
-        above_50ma and
         trending
     )
 
+    # BLUE TRIANGLE on 1h: overbought exit warning
     blue_tri = (
         rsi > 60 and
         mom5 < -mom_threshold and
@@ -169,29 +200,21 @@ def check_signals(candle_list):
         trending
     )
 
-    signal = None
-    if green_dot and vwap_above:
-        signal = "BUY"
+    signal = "BUY" if green_dot else None
 
-    indicators = {
-        "rsi":        round(rsi, 1),
-        "momentum":   round(mom5, 2),
-        "vwap":       round(vwap, 2),
-        "ma50":       round(ma50, 2),
-        "vwap_above": vwap_above,
-        "above_50ma": above_50ma,
-        "trending":   trending,
-        "green_dot":  green_dot,
-        "blue_tri":   blue_tri,
-        "oversold":   rsi < 45,
+    return signal, {
+        "rsi":       round(rsi, 1),
+        "momentum":  round(mom5, 2),
+        "green_dot": green_dot,
+        "blue_tri":  blue_tri,
+        "oversold":  rsi < 45,
+        "trending":  trending,
     }
 
-    return signal, indicators
-
 # ── Trade Management ──────────────────────────────────────────────────────────
-def open_new_trade(entry, signal_candle, indicators):
+def open_new_trade(entry, signal_candle_1h, trend_ind, entry_ind):
     global open_trade, last_signal_candle
-    stop = signal_candle["low"] * 0.999
+    stop = signal_candle_1h["low"] * 0.999
     risk = entry - stop
     if risk <= 0:
         log.warning("Risk <= 0, skipping trade.")
@@ -203,20 +226,25 @@ def open_new_trade(entry, signal_candle, indicators):
         "entry": entry, "stop": stop, "tp": tp,
         "size": size, "fee_in": fee
     }
-    # FIX 2: Record which candle triggered this entry so we never re-enter on same candle
-    last_signal_candle = signal_candle["time"]
+    last_signal_candle = signal_candle_1h["time"]
     mode = "[PAPER]" if PAPER else "[LIVE]"
     log.info(
         f"{mode} TRADE OPENED | Entry: ${entry:,.2f} | Stop: ${stop:,.2f} | "
         f"TP: ${tp:,.2f} | Size: {size:.6f} BTC | Fee: ${fee:.2f}"
     )
+    log.info(
+        f"  Trend (4h): 50MA=${trend_ind['ma50']:,.2f} | Above50MA={trend_ind['above_50ma']} | "
+        f"VWAP4h=${trend_ind['vwap_4h']:,.2f}"
+    )
+    log.info(
+        f"  Entry (1h): RSI={entry_ind['rsi']} | Momentum={entry_ind['momentum']:.2f} | "
+        f"GreenDot={entry_ind['green_dot']}"
+    )
 
 def check_trade_exit(price):
-    # FIX 1: Use live price (passed in) instead of stale candle high/low
     global open_trade, wins, losses, total_pnl, total_fees
     if not open_trade:
         return
-
     fee_out   = price * open_trade["size"] * 0.001
     total_fee = open_trade["fee_in"] + fee_out
     mode      = "[PAPER]" if PAPER else "[LIVE]"
@@ -237,18 +265,21 @@ def check_trade_exit(price):
         log.info(f"{mode} TP HIT ✅ | Exit: ${price:,.2f} | Net P&L: ${pnl:,.2f}")
         open_trade = None
 
-# ── Status Printer ─────────────────────────────────────────────────────────────
-def print_status(price, indicators):
+# ── Status Printer ────────────────────────────────────────────────────────────
+def print_status(price, trend_ind, entry_ind):
     total_trades = wins + losses
     win_rate = (wins / total_trades * 100) if total_trades else 0
     mode = "PAPER" if PAPER else "LIVE"
     log.info(
-        f"[{mode}] BTC: ${price:,.2f} | 50MA: ${indicators.get('ma50', 0):,.2f} | "
-        f"RSI: {indicators.get('rsi', 0)} | "
-        f"Oversold(<45): {indicators.get('oversold', False)} | "
-        f"Above50MA: {indicators.get('above_50ma', False)} | "
-        f"VWAP↑: {indicators.get('vwap_above', False)} | "
-        f"GreenDot: {indicators.get('green_dot', False)}"
+        f"[{mode}] BTC: ${price:,.2f} | "
+        f"50MA(4h): ${trend_ind.get('ma50', 0):,.2f} | "
+        f"Above50MA: {trend_ind.get('above_50ma', False)} | "
+        f"VWAP4h↑: {trend_ind.get('vwap_above', False)}"
+    )
+    log.info(
+        f"[{mode}] RSI(1h): {entry_ind.get('rsi', 0)} | "
+        f"Oversold(<45): {entry_ind.get('oversold', False)} | "
+        f"GreenDot(1h): {entry_ind.get('green_dot', False)}"
     )
     log.info(
         f"Trades: {total_trades} | Wins: {wins} | Losses: {losses} | "
@@ -264,43 +295,55 @@ def print_status(price, indicators):
 def main():
     global tick_count
     log.info("=" * 60)
-    log.info("Cipher Bot v5.1 — Starting up")
-    log.info(f"Pair: {PAIR} | Timeframe: {TIMEFRAME}min | Mode: {'PAPER' if PAPER else 'LIVE'}")
-    log.info(f"MA Filter: 50MA | RSI Threshold: <45 | Momentum: 0.05% of price")
+    log.info("Cipher Bot v5.2 — Dual Timeframe Strategy")
+    log.info(f"Pair: {PAIR} | Mode: {'PAPER' if PAPER else 'LIVE'}")
+    log.info(f"Trend Filter: 4h 50MA + 4h VWAP")
+    log.info(f"Entry Signal: 1h RSI <45 + 1h Momentum Flip")
     log.info(f"Capital: ${CAPITAL:,.2f} | Risk: {RISK_PCT}% | TP: {TP_MULTI}x")
     log.info("=" * 60)
 
     while True:
         try:
-            # Reload candles every 10 ticks (~5 min), price every tick
+            # Reload candles every 10 ticks (~5 min)
             if tick_count % 10 == 0:
-                fresh = get_candles()
-                if fresh:
-                    candles.clear()
-                    candles.extend(fresh)
+                fresh_4h = get_candles(TF_TREND, TF_TREND_NEEDED)
+                if fresh_4h:
+                    candles_4h.clear()
+                    candles_4h.extend(fresh_4h)
+
+                fresh_1h = get_candles(TF_ENTRY, TF_ENTRY_NEEDED)
+                if fresh_1h:
+                    candles_1h.clear()
+                    candles_1h.extend(fresh_1h)
 
             price = get_price()
-            if price and len(candles) >= CANDLES_NEEDED:
-                signal, indicators = check_signals(list(candles))
 
-                # FIX 1: Pass live price to exit checker (not stale candle data)
+            if (price
+                    and len(candles_4h) >= TF_TREND_NEEDED
+                    and len(candles_1h) >= TF_ENTRY_NEEDED):
+
+                trend_ok, trend_ind = check_trend(list(candles_4h))
+                entry_signal, entry_ind = check_entry(list(candles_1h))
+
+                # Exit check — uses live price
                 if open_trade:
                     check_trade_exit(price)
 
-                # FIX 2: Only enter if no open trade AND this candle hasn't fired yet
-                if signal == "BUY" and not open_trade:
-                    signal_candle = candles[-2] if len(candles) > 1 else candles[-1]
-                    if signal_candle["time"] != last_signal_candle:
+                # Entry — requires BOTH 4h trend AND 1h green dot
+                if entry_signal == "BUY" and trend_ok and not open_trade:
+                    signal_candle_1h = candles_1h[-2] if len(candles_1h) > 1 else candles_1h[-1]
+                    if signal_candle_1h["time"] != last_signal_candle:
                         open_new_trade(
                             entry=price,
-                            signal_candle=signal_candle,
-                            indicators=indicators
+                            signal_candle_1h=signal_candle_1h,
+                            trend_ind=trend_ind,
+                            entry_ind=entry_ind
                         )
                     else:
-                        log.info("Signal on same candle as last trade — skipping re-entry.")
+                        log.info("Signal on same 1h candle as last trade — skipping re-entry.")
 
                 if tick_count % 10 == 0:
-                    print_status(price, indicators)
+                    print_status(price, trend_ind, entry_ind)
 
             tick_count += 1
             time.sleep(30)
